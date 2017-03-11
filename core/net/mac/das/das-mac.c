@@ -20,6 +20,7 @@
 // }}}
 
 //TODO: Safety check all mmem_alloc calls
+//TODO: Use Packetqueue instead of current list
 
 // Macros {{{
 //Application definable macros
@@ -74,7 +75,7 @@ typedef enum {
 } NodeType;
 
 typedef enum {
-    PACKET_TYPE_NORMAL,
+    PACKET_TYPE_NORMAL = 1,
     PACKET_TYPE_DISSEM
 } PacketType;
 
@@ -261,44 +262,21 @@ static void dissem_timer_callback(void* ptr) {
     //If the timer has not been setup yet
     if(dissem_timer.f == NULL) {
         PRINTF("DAS-mac: Setting dissem timer\n");
-        /*ctimer_set(&dissem_timer, DAS_PERIOD_SEC*CLOCK_SECOND, dissem_timer_callback, NULL);*/
-        ctimer_set(&dissem_timer, 5*CLOCK_SECOND, dissem_timer_callback, NULL);
+        ctimer_set(&dissem_timer, DAS_PERIOD_SEC*CLOCK_SECOND, dissem_timer_callback, NULL);
     }
     else {
         PRINTF("DAS-mac: Resetting dissem timer\n");
         ctimer_reset(&dissem_timer);
     }
 
-    //TODO: Skip slot if slot == BOTTOM
-    /*if(slot != BOTTOM) {*/
-        /*rtimer_clock_t when = RTIMER_NOW() + (DAS_DISSEM_PERIOD_SEC + slot*DAS_SLOT_PERIOD_SEC)*RTIMER_SECOND;*/
-        /*rtimer_set(&slot_timer, when, 0, slot_timer_callback, NULL);*/
-    /*}*/
-    /*else {*/
-        /*//TODO: 21x too small*/
-        /*rtimer_clock_t when = RTIMER_NOW() + DAS_PERIOD_SEC*(float)RTIMER_SECOND*16;*/
-        /*PRINTF("DAS-mac: now=%u\n", (unsigned int)RTIMER_NOW());*/
-        /*PRINTF("DAS-mac: when=%u\n", (unsigned int)when);*/
-        /*PRINTF("DAS-mac: RTIMER_SECOND=%u\n", (unsigned int)RTIMER_SECOND);*/
-        /*PRINTF("DAS-mac: DAS_PERIOD_MILLI=%i\n", DAS_PERIOD_MILLI);*/
-        /*if(rtimer_set(&dissem_timer, when, 0, &dissem_timer_callback, NULL) != RTIMER_OK) {*/
-            /*PRINTF("DAS-mac: Could not reschedule dissem period\n");*/
-            /*[>switch(rtimer_err) {<]*/
-                /*[>case RTIMER_ERR_FULL: PRINTF("RTIMER_ERR_FULL\n"); break;<]*/
-                /*[>case RTIMER_ERR_TIME: PRINTF("RTIMER_ERR_TIME\n"); break;<]*/
-                /*[>case RTIMER_ERR_ALREADY_SCHEDULED: PRINTF("RTIMER_ERR_ALREADY_SCHEDULED\n"); break;<]*/
-                /*[>default: PRINTF("RTIMER unknown error\n");<]*/
-            /*[>}<]*/
-        /*}*/
-    /*}*/
     PRINTF("DAS-mac: Dissem active\n");
 
+    //TODO: Set this up to randomise dissem message send times
     //Send dissem message at random in range of DAS_DISSEM_PERIOD
-    /*PRINTF("DAS-mac: Setting dissem clock\n");*/
-    /*rtimer_clock_t offset = (rtimer_clock_t)(((float)random_rand()/(float)RANDOM_RAND_MAX)*DAS_DISSEM_PERIOD_SEC*RTIMER_SECOND);*/
-    /*rtimer_set(&dissem_send_timer, RTIMER_NOW() + offset, 0, dissem_send_timer_callback, NULL);*/
-
-    dissem_send_timer_callback(NULL, NULL);
+    PRINTF("DAS-mac: Setting dissem clock\n");
+    rtimer_clock_t offset = (rtimer_clock_t)(((float)random_rand()/(float)RANDOM_RAND_MAX)*DAS_DISSEM_PERIOD_SEC*RTIMER_SECOND);
+    rtimer_set(&dissem_send_timer, RTIMER_NOW() + offset, 0, dissem_send_timer_callback, NULL);
+    /*dissem_send_timer_callback(NULL, NULL);*/
 }
 
 /*static void normal_sent_callback(void* ptr, int status, int transmissions) {*/
@@ -472,11 +450,11 @@ static void packet_input(void) {
     packetbuf_compact();
     if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_DISSEM) {
         PRINTF("DAS-mac: Received dissem message\n");
-        /*handle_dissem_message();*/
+        handle_dissem_message();
     }
     else if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_NORMAL) {
         PRINTF("DAS-mac: Received normal message\n");
-        /*handle_normal_message();*/
+        handle_normal_message();
     }
     else {
         PRINTF("DAS-mac: Received unknown packet type\n");
@@ -563,9 +541,9 @@ static int on(void)
     hop = BOTTOM;
 
     //TODO:Clear these lists, init will not work
-    list_init(my_n);
-    list_init(n_info);
-    list_init(outgoing_packets);
+    /*list_init(my_n);*/
+    /*list_init(n_info);*/
+    /*list_init(outgoing_packets);*/
 
     dissem_timer_callback(NULL);
     /*ctimer_set(&dissem_timer, DAS_PERIOD_SEC*CLOCK_SECOND, dissem_timer_callback, NULL);*/
@@ -593,10 +571,11 @@ static void init(void)
     list_init(outgoing_packets);
 
     mmem_init();
-    random_init(0);
-    clock_init();
-    ctimer_init();
-    rtimer_init();
+    random_init(node_id);
+    //XXX: NEVER INIT THESE HERE, IT BREAKS ALL TIMERS
+    /*clock_init();*/
+    /*ctimer_init();*/
+    /*rtimer_init();*/
 
     //Initialise radio
     radio_value_t radio_rx_mode = 0;
