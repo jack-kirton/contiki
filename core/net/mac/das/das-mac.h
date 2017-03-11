@@ -4,6 +4,7 @@
 #include "net/mac/mac.h"
 //#include "dev/radio.h"
 #include "lib/list.h"
+#include "net/rime/packetqueue.h"
 
 extern const struct mac_driver das_mac_driver;
 
@@ -15,7 +16,7 @@ typedef struct DasOutgoingPacket {
 } DasOutgoingPacket;
 
 //Callback for the mac layer to aggregate packets from multiple sources into a single packet
-typedef void (*das_aggregation_callback)(list_t packets, DasOutgoingPacket* data);
+typedef void (*das_aggregation_callback)(struct packetqueue* packets);
 
 //Set before on is called
 void das_set_sink(int active);
