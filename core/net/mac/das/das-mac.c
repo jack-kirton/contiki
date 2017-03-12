@@ -135,19 +135,7 @@ static das_aggregation_callback aggregation_callback = NULL;
 // }}}
 
 // Helper Functions {{{
-static void packetbuf_align_inbound() {
-    unsigned char buffer[PACKETBUF_SIZE];
-    /*int bytes_read = packetbuf_copyto(&buffer);*/
-    /*packetbuf_clear();*/
-    /*int bytes_written = packetbuf_copyfrom(&buffer, bytes_read);*/
-    /*assert(bytes_read == bytes_written);*/
-
-    int data_len = packetbuf_datalen();
-    memcpy(&buffer, packetbuf_dataptr(), data_len);
-    packetbuf_clear();
-    packetbuf_copyfrom(&buffer, data_len);
-}
-
+//TODO: Pointless function, remove
 static int is_1hop_neighbour(int id) {
     //TODO: If alloc with mmem, needs changing
     void* el = list_head(my_n);
@@ -367,7 +355,6 @@ static void handle_normal_message() {
         /*OUTGOING_PTR(packet)->sent = NULL;*/
         /*OUTGOING_PTR(packet)->ptr = NULL;*/
         /*list_add(outgoing_packets, packet);*/
-        packetbuf_align_inbound();
         packetqueue_enqueue_packetbuf(&outgoing_packets, 0, NULL);
     }
 }
