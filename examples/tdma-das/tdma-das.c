@@ -20,11 +20,22 @@ AUTOSTART_PROCESSES(&das_test_process);
     /*printf("TEST CTIMER WORKED\n");*/
 /*}*/
 
+static void sent_callback(void* ptr, int status, int transmissions) {
+    if(status == MAC_TX_DEFERRED) return; //If deferred we don't care
+}
+
+static void das_callback(struct packetqueue* packets, mac_callback_t* sent, void** ptr) {
+    //TODO: Create a packet in packetbuf from packets queue
+    *sent = sent_callback;
+    *ptr = NULL;
+}
 
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(das_test_process, ev, data)
 {
     PROCESS_BEGIN();
+
+    das_set_aggregation_callback(das_callback);
 
     if(node_id == 1) {
         das_set_sink(1);

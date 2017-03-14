@@ -16,7 +16,7 @@ typedef struct DasOutgoingPacket {
 } DasOutgoingPacket;
 
 //Callback for the mac layer to aggregate packets from multiple sources into a single packet
-typedef void (*das_aggregation_callback)(struct packetqueue* packets);
+typedef void (*das_aggregation_callback)(struct packetqueue* packets, mac_callback_t* sent, void** ptr);
 
 //Set before on is called
 void das_set_sink(int active);

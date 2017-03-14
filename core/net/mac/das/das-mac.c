@@ -21,7 +21,6 @@
 
 //TODO: Safety check all mmem_alloc calls
 //TODO: Potentially remove mmem to use malloc instead?
-//TODO: Add sent callback argument to aggregation callback
 
 // Macros {{{
 //Application definable macros
@@ -323,11 +322,9 @@ static void dissem_timer_callback(void* ptr) {
 
     //If the timer has not been setup yet
     if(dissem_timer.f == NULL) {
-        PRINTF("DAS-mac: Setting dissem timer\n");
         ctimer_set(&dissem_timer, DAS_PERIOD_SEC*CLOCK_SECOND, dissem_timer_callback, NULL);
     }
     else {
-        PRINTF("DAS-mac: Resetting dissem timer\n");
         ctimer_reset(&dissem_timer);
     }
 
@@ -335,7 +332,6 @@ static void dissem_timer_callback(void* ptr) {
 
     build_neighbourinfo_message();
     //Send dissem message at random in range of DAS_DISSEM_PERIOD
-    PRINTF("DAS-mac: Setting dissem clock\n");
     rtimer_clock_t offset = (rtimer_clock_t)(((float)random_rand()/(float)RANDOM_RAND_MAX)*DAS_DISSEM_PERIOD_SEC*RTIMER_SECOND);
     rtimer_set(&dissem_send_timer, RTIMER_NOW() + offset, 0, dissem_send_timer_callback, NULL);
 }
@@ -352,41 +348,27 @@ static void slot_timer_callback(void* ptr) {
     PRINTF("DAS-mac: Slot active (%u)\n", slot);
     //TODO: Only want to send one aggregated packet of data per slot
 
-    (*aggregation_callback)(&outgoing_packets);
-    packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
-    packetbuf_set_attr(PACKETBUF_ATTR_MAC_SEQNO, packet_seqno);
-    packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_NORMAL);
-    NETSTACK_RDC.send(NULL, NULL);
+    if(packetqueue_len(&outgoing_packets) != 0) {
+        mac_callback_t sent = NULL;
+        void* ptr = NULL;
+        packetbuf_clear();
+        (*aggregation_callback)(&outgoing_packets, &sent, &ptr);
+        packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
+        packetbuf_set_attr(PACKETBUF_ATTR_MAC_SEQNO, packet_seqno);
+        packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_NORMAL);
+        NETSTACK_RDC.send(sent, ptr);
 
-    while(packetqueue_len(&outgoing_packets)) {
-        packetqueue_dequeue(&outgoing_packets); //Dequeue also frees internal queuebuf
+        while(packetqueue_len(&outgoing_packets)) {
+            packetqueue_dequeue(&outgoing_packets); //Dequeue also frees internal queuebuf
+        }
     }
-
-    /*DasOutgoingPacket aggregated_packet = {};*/
-    /*if(aggregated_packet.qb && aggregated_packet.sent) {*/
-        /*if(++packet_seqno == 0) {*/
-            /*packet_seqno++;*/
-        /*}*/
-        /*packetbuf_clear();*/
-        /*queuebuf_to_packetbuf(aggregated_packet.qb);*/
-        /*packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);*/
-        /*packetbuf_set_attr(PACKETBUF_ATTR_MAC_SEQNO, packet_seqno);*/
-        /*packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_NORMAL);*/
-        /*NETSTACK_RDC.send(aggregated_packet.sent, NULL);*/
-        /*[>mac_call_sent_callback(OUTGOING_PTR(&aggregated_packet)->sent, OUTGOING_PTR()->ptr, status, transmissions);<]*/
-    /*}*/
-
-    /*if(aggregated_packet.qb) {*/
-        /*queuebuf_free(aggregated_packet.qb);*/
-    /*}*/
-
-    /*struct mmem* packet = list_head(outgoing_packets);*/
-    /*while(packet) {*/
-        /*queuebuf_free(OUTGOING_PTR(packet)->qb);*/
-        /*mmem_free(packet);*/
-        /*list_pop(outgoing_packets); //TODO: Check that this does not break (popping before list_item_next())*/
-        /*packet = list_item_next(packet);*/
-    /*}*/
+    else {
+        //Send an empty normal message
+        packetbuf_clear();
+        packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
+        packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_EMPTY_NORMAL);
+        NETSTACK_RDC(NULL, NULL);
+    }
 }
 // }}}
 
@@ -409,18 +391,6 @@ static void handle_normal_message() {
         NETSTACK_NETWORK.input();
     }
     else {
-        //TODO: Use packetqueue instead of current list
-        //TODO: Also check for repeated sequence numbers?
-        /*packetbuf_compact(); //TODO: Does not move up header*/
-        /*packetbuf_set_addr(PACKETBUF_ADDR_SENDER, &linkaddr_node_addr);*/
-        /*packetbuf_set_attr(PACKETBUF_ATTR_HOPS, packetbuf_attr(PACKETBUF_ATTR_HOPS) + 1);*/
-        /*//TODO: Check if empty normal message?*/
-        /*struct mmem* packet = NULL;*/
-        /*mmem_alloc(packet, sizeof(DasOutgoingPacket));*/
-        /*OUTGOING_PTR(packet)->qb = queuebuf_new_from_packetbuf();*/
-        /*OUTGOING_PTR(packet)->sent = NULL;*/
-        /*OUTGOING_PTR(packet)->ptr = NULL;*/
-        /*list_add(outgoing_packets, packet);*/
         packetqueue_enqueue_packetbuf(&outgoing_packets, 0, NULL);
     }
 }
@@ -432,11 +402,11 @@ void das_set_sink(int active) {
     //Set before on is called
     node_type = (active) ? NODE_TYPE_SINK : NODE_TYPE_NORMAL;
 }
-
+/*---------------------------------------------------------------------------*/
 void das_set_aggregation_callback(das_aggregation_callback f) {
     aggregation_callback = f;
 }
-
+/*---------------------------------------------------------------------------*/
 static void packet_send(mac_callback_t sent, void* ptr) {
     //TODO: Set more attributes
     packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
@@ -444,47 +414,8 @@ static void packet_send(mac_callback_t sent, void* ptr) {
     packetqueue_enqueue_packetbuf(&outgoing_packets, 0, NULL);
     mac_call_sent_callback(sent, ptr, MAC_TX_DEFERRED, 0);
 }
-
-/*static void send_packet(mac_callback_t sent, void *ptr)*/
-/*{*/
-    /*//TODO Save sent for each packet in packetqueue*/
-    /*int retval = MAC_TX_DEFERRED;*/
-    /*[>const linkaddr_t *addr = packetbuf_addr(PACKETBUF_ADDR_RECEIVER);<]*/
-
-    /*//Something to do with the framer being unable to handle zero*/
-    /*if(++packet_seqno == 0)*/
-        /*packet_seqno++;*/
-
-    /*packetbuf_set_attr(PACKETBUF_ATTR_MAC_SEQNO, packet_seqno);*/
-    /*packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_NORMAL);*/
-
-    /*if(NETSTACK_FRAMER.create() < 0)*/
-    /*{*/
-        /*retval = MAC_TX_ERR;*/
-    /*}*/
-    /*else*/
-    /*{*/
-        /*//Add packet to queue*/
-        /*if(das_queue_outgoing_add(sent, ptr)<0)*/
-        /*{*/
-            /*retval = MAC_TX_ERR;*/
-        /*}*/
-    /*}*/
-
-    /*if(retval != MAC_TX_DEFERRED)*/
-    /*{*/
-        /*mac_call_sent_callback(sent, ptr, retval, 1);*/
-    /*}*/
-/*}*/
-
-
 /*---------------------------------------------------------------------------*/
 static void packet_input(void) {
-    //TODO: Does RDC call the framer? Probably not
-    /*if(NETSTACK_FRAMER.parse() < 0) {*/
-        /*PRINTF("DAS-mac: Framer failed to parse %u\n", packetbuf_datalen());*/
-        /*return;*/
-    /*}*/
     if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_DISSEM) {
         PRINTF("DAS-mac: Received dissem message\n");
         handle_dissem_message();
@@ -492,6 +423,9 @@ static void packet_input(void) {
     else if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_NORMAL) {
         PRINTF("DAS-mac: Received normal message\n");
         handle_normal_message();
+    }
+    else if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_EMPTY_NORMAL) {
+        PRINTF("DAS-mac: Received empty normal message\n");
     }
     else {
         PRINTF("DAS-mac: Received unknown packet type\n");
@@ -505,6 +439,12 @@ static int on(void)
         PRINTF("DAS-mac: Already on\n");
         return 0;
     }
+
+    if(aggregation_callback == NULL) {
+        PRINTF("DAS-mac: Aggregation callback must be set before starting!\n");
+        return 0;
+    }
+
     parent = BOTTOM;
     slot = BOTTOM;
     hop = BOTTOM;
