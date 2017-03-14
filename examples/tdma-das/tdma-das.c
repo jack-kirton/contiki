@@ -5,6 +5,7 @@
 #include "sys/etimer.h"
 #include "sys/ctimer.h"
 #include "sys/clock.h"
+#include "sys/node-id.h"
 
 #include <stdio.h> /* For printf() */
 #include <assert.h>
@@ -24,6 +25,13 @@ AUTOSTART_PROCESSES(&das_test_process);
 PROCESS_THREAD(das_test_process, ev, data)
 {
     PROCESS_BEGIN();
+
+    if(node_id == 1) {
+        das_set_sink(1);
+    }
+    else {
+        das_set_sink(0);
+    }
 
     NETSTACK_MAC.on();
 

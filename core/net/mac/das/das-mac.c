@@ -15,11 +15,13 @@
 #include "sys/rtimer.h"
 #include "net/rime/packetqueue.h"
 
+#include <stdlib.h>
 #include <string.h>
 // }}}
 
 //TODO: Safety check all mmem_alloc calls
-//TODO: Use Packetqueue instead of current list
+//TODO: Potentially remove mmem to use malloc instead?
+//TODO: Add sent callback argument to aggregation callback
 
 // Macros {{{
 //Application definable macros
@@ -67,7 +69,8 @@
 #define DISSEM_PTR(dissem_message) ((NeighbourInfoMessage*)MMEM_PTR(dissem_message))
 #define DISSEM_SIZE(dissem_message) (sizeof(NeighbourInfoMessage) + sizeof(NeighbourInfo)*((NeighbourInfoMessage*)MMEM_PTR(dissem_message))->num_neighbours)
 #define OUTGOING_PTR(packet) ((DasOutgoingPacket*)MMEM_PTR(packet))
-#define NEIGHBOUR_PTR(neighbour_info) ((NeighbourInfo*)MMEM_PTR(neighbour_info))
+#define NEIGHBOURINFO_PTR(neighbour_info) ((NeighbourInfo*)MMEM_PTR(neighbour_info))
+#define NEIGHBOUR_PTR(neighbour) *((unsigned short*)MMEM_PTR(neighbour->data))
 // }}}
 
 // Data Structures and Enumerations {{{
@@ -93,7 +96,7 @@ typedef struct NeighbourInfo {
     int slot;
 } NeighbourInfo;
 
-typedef struct NeighbourInfoMessage {
+typedef struct __attribute__ ((__packed__)) NeighbourInfoMessage {
     unsigned short id;
     int num_neighbours;
     NeighbourInfo neighbours[];
@@ -127,7 +130,6 @@ static NodeType node_type;
 static struct ctimer dissem_timer = {};
 static struct rtimer dissem_send_timer = {};
 static struct ctimer slot_timer = {};
-static struct ctimer postslot_timer = {};
 
 uint8_t packet_seqno = 0;
 
@@ -135,12 +137,66 @@ static das_aggregation_callback aggregation_callback = NULL;
 // }}}
 
 // Helper Functions {{{
-//TODO: Pointless function, remove
-static int is_1hop_neighbour(int id) {
-    //TODO: If alloc with mmem, needs changing
-    void* el = list_head(my_n);
+static void add_neighbour_id(unsigned short id) {
+    Neighbour* el = list_head(my_n);
     while(el) {
-        if(((Neighbour*)el)->id == id) {
+        if(el->id == id) {
+            PRINTF("DAS-mac: my_n id already exists\n");
+            return;
+        }
+        el = list_item_next(el);
+    }
+
+    PRINTF("Asserting...\n");
+    ASSERT(el = malloc(sizeof(Neighbour)));
+    el->id = id;
+    list_add(my_n, el);
+    PRINTF("DAS-mac: my_n length %d\n", list_length(my_n));
+}
+
+static void add_neighbour_info(NeighbourInfo* info) {
+    NeighbourInfo* el = list_head(n_info);
+    while(el) {
+        if(el->id == info->id) {
+            if(info->slot != BOTTOM) {
+                if(el->slot == BOTTOM || el->slot > info->slot) {
+                    el->slot = info->slot;
+                }
+            }
+            if(info->hop != BOTTOM) {
+                if(info->hop == BOTTOM || el->hop > info->hop) {
+                    el->hop = info->hop;
+                }
+            }
+            return;
+        }
+        el = list_item_next(el);
+    }
+
+    ASSERT(el = malloc(sizeof(NeighbourInfo)));
+    /*memcpy(el, info, sizeof(NeighbourInfo));*/
+    el->id = info->id;
+    el->slot = info->slot;
+    el->hop = info->hop;
+    list_add(n_info, el);
+    PRINTF("DAS-mac: n_info length %d\n", list_length(n_info));
+
+#if DAS_DEBUG
+    el = list_head(n_info);
+    PRINTF("n_info: ");
+    while(el) {
+        PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>", el->id, el->slot, el->hop);
+        el = list_item_next(el);
+        if(el) PRINTF(", ");
+    }
+    PRINTF("\n");
+#endif
+}
+
+static int is_1hop_neighbour(int id) {
+    Neighbour* el = list_head(my_n);
+    while(el) {
+        if(el->id == id) {
             return 1;
         }
         el = list_item_next(el);
@@ -168,24 +224,30 @@ static void build_neighbourinfo_message() {
         PRINTF("DAS-mac: Could not allocate NeighbourInfoMessage. Aborting...\n");
         //TODO: Abort program here
     }
-    DISSEM_PTR(&dissem_message)->id = 0;
+    DISSEM_PTR(&dissem_message)->id = node_id;
     DISSEM_PTR(&dissem_message)->num_neighbours = len;
-    void* el = list_head(n_info);
+    PRINTF("NUM_NEIGHBOURS IS %d\n", DISSEM_PTR(&dissem_message)->num_neighbours);
+    PRINTF("N_INFO size %d\n", list_length(n_info));
+    NeighbourInfo* el = list_head(n_info);
     int i = 0;
     while(el) {
         if(i >= len) {
             break;
         }
-        else if(!is_1hop_neighbour(((NeighbourInfo*)el)->id)) {
+        else if(!is_1hop_neighbour(el->id)) {
+            PRINTF("IS NOT 1HOP NEIGHBOUR\n");
             el = list_item_next(el);
             continue;
         }
         else {
-            memcpy(&(DISSEM_PTR(&dissem_message)->neighbours[i]), el, sizeof(NeighbourInfo));
+            DISSEM_PTR(&dissem_message)->neighbours[i].id = el->id;
+            DISSEM_PTR(&dissem_message)->neighbours[i].slot = el->slot;
+            DISSEM_PTR(&dissem_message)->neighbours[i].hop = el->hop;
             i++;
             el = list_item_next(el);
         }
     }
+    PRINTF("DAS-mac: Built NeighbourInfoMessage with size %d\n", i);
 }
 
 static void update_slot(int new_slot) {
@@ -241,22 +303,20 @@ static void dissem_sent_callback(void* ptr, int status, int transmissions) {
 }
 
 static void dissem_send_timer_callback(struct rtimer* task, void* ptr) {
-    PRINTF("DAS-mac: Dissem sending...\n");
-    /*struct mmem* dissem_message = (struct mmem*)ptr;*/
     //TODO: Check this does not fill the packetbuf
     packetbuf_clear();
     /*packetbuf_copyfrom(MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));*/
     assert(DISSEM_SIZE(&dissem_message) <= PACKETBUF_SIZE); //This will not catch all cases (assumes no header)
-    memcpy(packetbuf_dataptr(), MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));
+    /*memcpy(packetbuf_dataptr(), MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));*/
+    packetbuf_copyfrom(MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));
 
     packetbuf_set_addr(PACKETBUF_ADDR_SENDER, &linkaddr_node_addr);
     packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_DISSEM);
     NETSTACK_RDC.send(dissem_sent_callback, NULL);
-    /*mmem_free(dissem_message);*/
 }
 
 static void dissem_timer_callback(void* ptr) {
-    if(slot_changed) {
+    if(slot_changed && node_type != NODE_TYPE_SINK) {
         slot_changed = 0;
         ctimer_set(&slot_timer, (DAS_DISSEM_PERIOD_SEC + slot*DAS_SLOT_PERIOD_SEC)*CLOCK_SECOND, slot_timer_callback, NULL);
     }
@@ -274,12 +334,10 @@ static void dissem_timer_callback(void* ptr) {
     PRINTF("DAS-mac: Dissem active\n");
 
     build_neighbourinfo_message();
-    //TODO: Set this up to randomise dissem message send times
     //Send dissem message at random in range of DAS_DISSEM_PERIOD
     PRINTF("DAS-mac: Setting dissem clock\n");
     rtimer_clock_t offset = (rtimer_clock_t)(((float)random_rand()/(float)RANDOM_RAND_MAX)*DAS_DISSEM_PERIOD_SEC*RTIMER_SECOND);
     rtimer_set(&dissem_send_timer, RTIMER_NOW() + offset, 0, dissem_send_timer_callback, NULL);
-    /*dissem_send_timer_callback(NULL, NULL);*/
 }
 
 /*static void normal_sent_callback(void* ptr, int status, int transmissions) {*/
@@ -301,7 +359,7 @@ static void slot_timer_callback(void* ptr) {
     NETSTACK_RDC.send(NULL, NULL);
 
     while(packetqueue_len(&outgoing_packets)) {
-        packetqueue_dequeue(&outgoing_packets);
+        packetqueue_dequeue(&outgoing_packets); //Dequeue also frees internal queuebuf
     }
 
     /*DasOutgoingPacket aggregated_packet = {};*/
@@ -334,7 +392,15 @@ static void slot_timer_callback(void* ptr) {
 
 // Other Functions {{{
 static void handle_dissem_message() {
-    //TODO: Handle dissem messages from packetbuf
+    //TODO: packetbuf_dataptr() probably points to the header? Remove header in RDC or framer?
+    NeighbourInfoMessage* message = packetbuf_dataptr();
+    add_neighbour_id(message->id);
+    int i;
+    for(i = 0; i < message->num_neighbours; i++) {
+        PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);
+        /*add_neighbour_info(&((message->neighbours)[i]));*/
+        add_neighbour_info(&(message->neighbours[i]));
+    }
 }
 
 static void handle_normal_message() {
@@ -372,11 +438,11 @@ void das_set_aggregation_callback(das_aggregation_callback f) {
 }
 
 static void packet_send(mac_callback_t sent, void* ptr) {
-    //TODO: Deal with sent and ptr
     //TODO: Set more attributes
     packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
     packetbuf_set_attr(PACKETBUF_ATTR_HOPS, 0);
     packetqueue_enqueue_packetbuf(&outgoing_packets, 0, NULL);
+    mac_call_sent_callback(sent, ptr, MAC_TX_DEFERRED, 0);
 }
 
 /*static void send_packet(mac_callback_t sent, void *ptr)*/
@@ -431,74 +497,6 @@ static void packet_input(void) {
         PRINTF("DAS-mac: Received unknown packet type\n");
     }
 }
-
-/*static void packet_input(void)*/
-/*{*/
-    /*//TODO Filter between application level messages and TDMA messages*/
-    /*if(NETSTACK_FRAMER.parse() < 0)*/
-    /*{*/
-        /*//Framer couldn't parse frame*/
-        /*PRINTF("Failed to parse %u\n", packetbuf_datalen());*/
-        /*return;*/
-    /*}*/
-
-    /*//TODO Check for TDMA messages*/
-    /*if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == DISSEM_MESSAGE)*/
-    /*{*/
-        /*//TODO TDMA stuff*/
-    /*}*/
-    /*else if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == NORMAL_MESSAGE)*/
-    /*{*/
-        /* If node is sink, NETSTACK_NETWORK.input()
-         * Else, add packet to outgoing packets (after setting addr, attrs, etc)
-         */
-        /*if(type == SINK_NODE)*/
-        /*{*/
-            /*NETSTACK_LLSEC.input();*/
-        /*}*/
-        /*else if(type == NORMAL_NODE)*/
-        /*{*/
-            /*//TODO Add packet to outgoing*/
-            /* Copy packet data out of packetbuf
-             * Clear packetbuf
-             * Copy data into data section
-             * Set header attrs and addr
-             * Enqueue in packetqueue
-             */
-            /*
-             *void* data_ptr = packetbuf_dataptr();
-             *void* hdr_ptr = packetbuf_hdrptr();
-             *[>uint16_t hdr_len = packetbuf_hdrlen();<] //Will be zero for incoming packets
-             *memcpy(hdr_ptr, data_ptr, PACKETBUF_HDR_SIZE); //XXX This probably doesn't work
-             *memcpy(data_ptr, ((uint8_t*)data_ptr)+PACKETBUF_HDR_SIZE, data_len-PACKETBUF_HDR_SIZE);
-             */
-
-            /*uint8_t temp_packet[PACKETBUF_SIZE];*/
-            /*uint16_t data_len = packetbuf_datalen();*/
-            /*packetbuf_copyto(&temp_packet);*/
-            /*packetbuf_clear();*/
-            /*packetbuf_copyfrom(&temp_packet, data_len);*/
-            /*das_queue_outgoing_add(NULL, NULL);*/
-            /*packetbuf_clear();*/
-        /*}*/
-        /*else if(type == SOURCE_NODE)*/
-        /*{*/
-            /*//Source node does nothing*/
-        /*}*/
-        /*else*/
-        /*{*/
-            /*//Unknown node type*/
-        /*}*/
-    /*}*/
-    /*else*/
-    /*{*/
-        /*//Unknown packet type*/
-    /*}*/
-
-    /*//Not using LLSEC*/
-    /*[>NETSTACK_LLSEC.input();<]*/
-    /*[>NETSTACK_NETWORK.input();<]*/
-/*}*/
 /*---------------------------------------------------------------------------*/
 static int on(void)
 {
@@ -515,6 +513,18 @@ static int on(void)
     /*list_init(my_n);*/
     /*list_init(n_info);*/
     /*list_init(outgoing_packets);*/
+
+    add_neighbour_id(node_id);
+
+    NeighbourInfo self_info = {};
+    self_info.id = node_id;
+    self_info.slot = BOTTOM;
+    self_info.hop = BOTTOM;
+    add_neighbour_info(&self_info);
+
+    if(node_type == NODE_TYPE_SINK) {
+        update_slot_and_hop(DAS_NUM_SLOTS, 0);
+    }
 
     dissem_timer_callback(NULL);
     is_on = 1;
