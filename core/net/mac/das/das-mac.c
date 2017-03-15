@@ -47,7 +47,7 @@
     #define DAS_GUARD_PERIOD_MILLI 0
 #endif
 #ifndef DAS_NEIGHBOUR_DISCOVERY_PERIODS
-    #define DAS_NEIGHBOUR_DISCOVERY_PERIODS 5
+    #define DAS_NEIGHBOUR_DISCOVERY_PERIODS 2
 #endif
 #ifndef DAS_OUTGOING_QUEUE_SIZE
     #define DAS_OUTGOING_QUEUE_SIZE 8
@@ -80,6 +80,7 @@ typedef enum {
 
 typedef enum {
     PACKET_TYPE_NORMAL = 1,
+    PACKET_TYPE_EMPTY_NORMAL,
     PACKET_TYPE_DISSEM
 } PacketType;
 
@@ -96,10 +97,17 @@ typedef struct NeighbourInfo {
 } NeighbourInfo;
 
 typedef struct __attribute__ ((__packed__)) NeighbourInfoMessage {
+    uint8_t normal;
     unsigned short id;
-    int num_neighbours;
+    unsigned short num_neighbours;
     NeighbourInfo neighbours[];
 } NeighbourInfoMessage;
+
+typedef struct Other {
+    void* next;
+    unsigned short id;
+    LIST_STRUCT(ids);
+} Other;
 // }}}
 
 // Function Prototypes {{{
@@ -108,20 +116,27 @@ static void dissem_sent_callback(void* ptr, int status, int transmissions);
 static void dissem_send_timer_callback(struct rtimer* task, void* ptr);
 static void dissem_timer_callback(void* ptr);
 static void slot_timer_callback(void* ptr);
+static void process_dissem();
+static void process_collisions();
 // }}}
 
 // Global Variables {{{
 static int is_init = 0;
 static int is_on = 0;
+static unsigned int period_count = 0;
 
 static int parent;
 static int slot;
 static int hop;
+static uint8_t normal = 1;
 
 static volatile int slot_changed = 0;
 
 LIST(my_n);
 LIST(n_info);
+LIST(n_par);
+LIST(others);
+LIST(children);
 PACKETQUEUE(outgoing_packets, DAS_OUTGOING_QUEUE_SIZE);
 
 static NodeType node_type;
@@ -136,21 +151,64 @@ static das_aggregation_callback aggregation_callback = NULL;
 // }}}
 
 // Helper Functions {{{
-static void add_neighbour_id(unsigned short id) {
-    Neighbour* el = list_head(my_n);
+static int rank(list_t neighbour_list, unsigned short id) {
+    Neighbour* el = list_head(neighbour_list);
+    int i = 0;
     while(el) {
         if(el->id == id) {
-            PRINTF("DAS-mac: my_n id already exists\n");
+            return i+1;
+        }
+        i++;
+        el = list_item_next(el);
+    }
+    return BOTTOM;
+}
+
+static void add_neighbour_id(list_t list, unsigned short id) {
+    Neighbour* el = list_head(list);
+    while(el) {
+        if(el->id == id) {
             return;
         }
         el = list_item_next(el);
     }
 
-    PRINTF("Asserting...\n");
-    ASSERT(el = malloc(sizeof(Neighbour)));
-    el->id = id;
-    list_add(my_n, el);
-    PRINTF("DAS-mac: my_n length %d\n", list_length(my_n));
+    Neighbour* new_neighbour = NULL;
+    ASSERT(new_neighbour = malloc(sizeof(Neighbour)));
+    new_neighbour->id = id;
+
+    //Insert in sorted order
+    el = list_head(list);
+    if(!el) {
+        list_add(list, new_neighbour);
+        return;
+    }
+    else if(el->id > id) {
+        list_push(list, new_neighbour);
+        return;
+    }
+    Neighbour* el_next = list_head(list);
+    el_next = list_item_next(el_next);
+    while(el_next != NULL && el_next->id < id) {
+        el = el_next;
+        el_next = list_item_next(el_next);
+    }
+    list_insert(list, el, new_neighbour);
+}
+
+static void add_my_n(unsigned short id) {
+    add_neighbour_id(my_n, id);
+#if DAS_DEBUG
+    Neighbour* el = NULL;
+    el = list_head(my_n);
+    PRINTF("my_n: ");
+    while(el) {
+        PRINTF("%u", el->id);
+        el = list_item_next(el);
+        if(el) PRINTF(", ");
+    }
+    PRINTF("\n");
+#endif
 }
 
 static void add_neighbour_info(NeighbourInfo* info) {
@@ -163,7 +221,7 @@ static void add_neighbour_info(NeighbourInfo* info) {
                 }
             }
             if(info->hop != BOTTOM) {
-                if(info->hop == BOTTOM || el->hop > info->hop) {
+                if(el->hop == BOTTOM || el->hop > info->hop) {
                     el->hop = info->hop;
                 }
             }
@@ -192,6 +250,35 @@ static void add_neighbour_info(NeighbourInfo* info) {
 #endif
 }
 
+void add_n_par(unsigned short id) {
+    Neighbour* potential_parent;
+    ASSERT(potential_parent = malloc(sizeof(Neighbour)));
+    potential_parent->id = id;
+    list_add(n_par, potential_parent);
+}
+
+void add_other(NeighbourInfoMessage* message) {
+    Other* other = list_head(others);
+    while(other) {
+        if(message->id == other->id) {
+            break;
+        }
+        other = list_item_next(other);
+    }
+
+    if(!other) {
+        ASSERT(other = malloc(sizeof(Other)));
+        other->id = message->id;
+        LIST_STRUCT_INIT(other, ids);
+        list_add(others, other);
+    }
+
+    int i;
+    for(i = 0; i < message->num_neighbours; i++) {
+        add_neighbour_id(other->ids, message->neighbours[i].id);
+    }
+}
+
 static int is_1hop_neighbour(int id) {
     Neighbour* el = list_head(my_n);
     while(el) {
@@ -215,6 +302,16 @@ static NeighbourInfo* get_neighbourinfo(int id) {
     return NULL;
 }
 
+static Other* get_other(unsigned short id) {
+    Other* el = list_head(others);
+    while(el) {
+        if(el->id == id) {
+            return el;
+        }
+    }
+    return NULL;
+}
+
 static struct mmem dissem_message;
 
 static void build_neighbourinfo_message() {
@@ -223,6 +320,7 @@ static void build_neighbourinfo_message() {
         PRINTF("DAS-mac: Could not allocate NeighbourInfoMessage. Aborting...\n");
         //TODO: Abort program here
     }
+    DISSEM_PTR(&dissem_message)->normal = normal;
     DISSEM_PTR(&dissem_message)->id = node_id;
     DISSEM_PTR(&dissem_message)->num_neighbours = len;
     PRINTF("NUM_NEIGHBOURS IS %d\n", DISSEM_PTR(&dissem_message)->num_neighbours);
@@ -304,9 +402,7 @@ static void dissem_sent_callback(void* ptr, int status, int transmissions) {
 static void dissem_send_timer_callback(struct rtimer* task, void* ptr) {
     //TODO: Check this does not fill the packetbuf
     packetbuf_clear();
-    /*packetbuf_copyfrom(MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));*/
     assert(DISSEM_SIZE(&dissem_message) <= PACKETBUF_SIZE); //This will not catch all cases (assumes no header)
-    /*memcpy(packetbuf_dataptr(), MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));*/
     packetbuf_copyfrom(MMEM_PTR(&dissem_message), DISSEM_SIZE(&dissem_message));
 
     packetbuf_set_addr(PACKETBUF_ADDR_SENDER, &linkaddr_node_addr);
@@ -334,6 +430,12 @@ static void dissem_timer_callback(void* ptr) {
     //Send dissem message at random in range of DAS_DISSEM_PERIOD
     rtimer_clock_t offset = (rtimer_clock_t)(((float)random_rand()/(float)RANDOM_RAND_MAX)*DAS_DISSEM_PERIOD_SEC*RTIMER_SECOND);
     rtimer_set(&dissem_send_timer, RTIMER_NOW() + offset, 0, dissem_send_timer_callback, NULL);
+
+    if(period_count >= DAS_NEIGHBOUR_DISCOVERY_PERIODS) {
+        process_dissem();
+        process_collisions();
+    }
+    period_count++;
 }
 
 /*static void normal_sent_callback(void* ptr, int status, int transmissions) {*/
@@ -367,21 +469,93 @@ static void slot_timer_callback(void* ptr) {
         packetbuf_clear();
         packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
         packetbuf_set_attr(PACKETBUF_ATTR_PACKET_TYPE, PACKET_TYPE_EMPTY_NORMAL);
-        NETSTACK_RDC(NULL, NULL);
+        NETSTACK_RDC.send(NULL, NULL);
     }
 }
 // }}}
 
-// Other Functions {{{
+// Process Things {{{
+static void process_dissem() {
+    if(slot == BOTTOM) {
+        PRINTF("Processing dissem\n");
+        int new_hop = BOTTOM;
+        int new_parent = BOTTOM;
+        int new_slot = BOTTOM;
+        Neighbour* n = list_head(n_par);
+        NeighbourInfo* parent_info = NULL;
+        PRINTF("BEFORE LOOP\n");
+        while(n) {
+            PRINTF("LOOPING\n");
+            NeighbourInfo* info = get_neighbourinfo(n->id);
+            ASSERT(info);
+            if(new_hop == BOTTOM || new_hop > info->hop) {
+                new_hop = info->hop;
+                new_parent = n->id;
+                parent_info = info;
+            }
+            n = list_item_next(n);
+        }
+        PRINTF("Decided on parent and hop\n");
+        //TODO: Make sure things aren't still NULL
+        new_hop += 1;
+        new_slot = parent_info->slot - rank(get_other(new_parent)->ids, new_parent) - 1; //TODO: Check get_other() doesn't return NULL
+        PRINTF("par=%d, slot=%d, hop=%d\n", new_parent, new_slot, new_hop);
+        update_slot_and_hop(new_slot, new_hop);
+        update_parent(new_parent);
+
+        n = list_head(my_n);
+        while(n) {
+            if(get_neighbourinfo(n->id)->slot == BOTTOM) { //TODO: Check that this isn't NULL
+                add_neighbour_id(children, n->id);
+            }
+            n = list_item_next(n);
+        }
+    }
+}
+
+static void process_collisions() {
+    return;
+}
+// }}}
+
+// Message Handlers {{{
 static void handle_dissem_message() {
     //TODO: packetbuf_dataptr() probably points to the header? Remove header in RDC or framer?
     NeighbourInfoMessage* message = packetbuf_dataptr();
-    add_neighbour_id(message->id);
+    add_my_n(message->id);
+
+
     int i;
-    for(i = 0; i < message->num_neighbours; i++) {
-        PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);
-        /*add_neighbour_info(&((message->neighbours)[i]));*/
-        add_neighbour_info(&(message->neighbours[i]));
+    if(message->normal) {
+        NeighbourInfo* message_info = NULL;
+        for(i = 0; i < message->num_neighbours; i++) {
+            PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);
+            add_neighbour_info(&(message->neighbours[i]));
+            if(message->neighbours[i].id == message->id) {
+                message_info = &(message->neighbours[i]);
+            }
+        }
+        if(slot == BOTTOM && message_info->slot != BOTTOM) {
+            add_n_par(message_info->id);
+            add_other(message);
+        }
+    }
+    else {
+        if(parent == message->id) {
+            NeighbourInfo* message_info = NULL;
+            for(i = 0; i < message->num_neighbours; i++) {
+                PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);
+                add_neighbour_info(&(message->neighbours[i]));
+                if(message->neighbours[i].id == message->id) {
+                    message_info = &(message->neighbours[i]);
+                }
+            }
+
+            if(slot >= message_info->slot) {
+                update_slot(message_info->slot - 1);
+                normal = 0;
+            }
+        }
     }
 }
 
@@ -410,7 +584,7 @@ void das_set_aggregation_callback(das_aggregation_callback f) {
 static void packet_send(mac_callback_t sent, void* ptr) {
     //TODO: Set more attributes
     packetbuf_set_addr(PACKETBUF_ADDR_ESENDER, &linkaddr_node_addr);
-    packetbuf_set_attr(PACKETBUF_ATTR_HOPS, 0);
+    packetbuf_set_attr(PACKETBUF_ATTR_HOPS, 1);
     packetqueue_enqueue_packetbuf(&outgoing_packets, 0, NULL);
     mac_call_sent_callback(sent, ptr, MAC_TX_DEFERRED, 0);
 }
@@ -454,7 +628,7 @@ static int on(void)
     /*list_init(n_info);*/
     /*list_init(outgoing_packets);*/
 
-    add_neighbour_id(node_id);
+    add_my_n(node_id);
 
     NeighbourInfo self_info = {};
     self_info.id = node_id;
@@ -488,6 +662,9 @@ static void init(void)
     node_type = NODE_TYPE_NORMAL;
     list_init(my_n);
     list_init(n_info);
+    list_init(n_par);
+    list_init(others);
+    list_init(children);
     packetqueue_init(&outgoing_packets);
 
     mmem_init();
@@ -497,6 +674,7 @@ static void init(void)
     /*ctimer_init();*/
     /*rtimer_init();*/
 
+    //TODO: Possibly move this to RDC
     //Initialise radio
     radio_value_t radio_rx_mode = 0;
     radio_value_t radio_tx_mode = 0;

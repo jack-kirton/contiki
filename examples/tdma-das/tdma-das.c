@@ -21,7 +21,7 @@ AUTOSTART_PROCESSES(&das_test_process);
 /*}*/
 
 static void sent_callback(void* ptr, int status, int transmissions) {
-    if(status == MAC_TX_DEFERRED) return; //If deferred we don't care
+    return;
 }
 
 static void das_callback(struct packetqueue* packets, mac_callback_t* sent, void** ptr) {
