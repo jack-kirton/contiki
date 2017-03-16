@@ -47,7 +47,7 @@
     #define DAS_GUARD_PERIOD_MILLI 0
 #endif
 #ifndef DAS_NEIGHBOUR_DISCOVERY_PERIODS
-    #define DAS_NEIGHBOUR_DISCOVERY_PERIODS 2
+    #define DAS_NEIGHBOUR_DISCOVERY_PERIODS 4
 #endif
 #ifndef DAS_OUTGOING_QUEUE_SIZE
     #define DAS_OUTGOING_QUEUE_SIZE 8
@@ -275,8 +275,22 @@ void add_other(NeighbourInfoMessage* message) {
 
     int i;
     for(i = 0; i < message->num_neighbours; i++) {
-        add_neighbour_id(other->ids, message->neighbours[i].id);
+        if(message->neighbours[i].slot == BOTTOM) {
+            add_neighbour_id(other->ids, message->neighbours[i].id);
+        }
     }
+
+#if DAS_DEBUG
+    Neighbour* el = NULL;
+    el = list_head(other->ids);
+    PRINTF("Other %u: ", other->id);
+    while(el) {
+        PRINTF("%u", el->id);
+        el = list_item_next(el);
+        if(el) PRINTF(", ");
+    }
+    PRINTF("\n");
+#endif
 }
 
 static int is_1hop_neighbour(int id) {
@@ -302,7 +316,8 @@ static NeighbourInfo* get_neighbourinfo(int id) {
     return NULL;
 }
 
-static Other* get_other(unsigned short id) {
+static Other* get_other(int id) {
+    if(id == BOTTOM) return NULL;
     Other* el = list_head(others);
     while(el) {
         if(el->id == id) {
@@ -323,8 +338,6 @@ static void build_neighbourinfo_message() {
     DISSEM_PTR(&dissem_message)->normal = normal;
     DISSEM_PTR(&dissem_message)->id = node_id;
     DISSEM_PTR(&dissem_message)->num_neighbours = len;
-    PRINTF("NUM_NEIGHBOURS IS %d\n", DISSEM_PTR(&dissem_message)->num_neighbours);
-    PRINTF("N_INFO size %d\n", list_length(n_info));
     NeighbourInfo* el = list_head(n_info);
     int i = 0;
     while(el) {
@@ -332,7 +345,6 @@ static void build_neighbourinfo_message() {
             break;
         }
         else if(!is_1hop_neighbour(el->id)) {
-            PRINTF("IS NOT 1HOP NEIGHBOUR\n");
             el = list_item_next(el);
             continue;
         }
@@ -344,7 +356,7 @@ static void build_neighbourinfo_message() {
             el = list_item_next(el);
         }
     }
-    PRINTF("DAS-mac: Built NeighbourInfoMessage with size %d\n", i);
+    /*PRINTF("DAS-mac: Built NeighbourInfoMessage with size %d\n", i);*/
 }
 
 static void update_slot(int new_slot) {
@@ -396,7 +408,7 @@ static void update_parent(int parent_id) {
 static void dissem_sent_callback(void* ptr, int status, int transmissions) {
     //Free message after sending complete
     mmem_free(&dissem_message);
-    PRINTF("DAS-mac: Dissem sent\n");
+    /*PRINTF("DAS-mac: Dissem sent\n");*/
 }
 
 static void dissem_send_timer_callback(struct rtimer* task, void* ptr) {
@@ -424,14 +436,14 @@ static void dissem_timer_callback(void* ptr) {
         ctimer_reset(&dissem_timer);
     }
 
-    PRINTF("DAS-mac: Dissem active\n");
+    /*PRINTF("DAS-mac: Dissem active\n");*/
 
     build_neighbourinfo_message();
     //Send dissem message at random in range of DAS_DISSEM_PERIOD
     rtimer_clock_t offset = (rtimer_clock_t)(((float)random_rand()/(float)RANDOM_RAND_MAX)*DAS_DISSEM_PERIOD_SEC*RTIMER_SECOND);
     rtimer_set(&dissem_send_timer, RTIMER_NOW() + offset, 0, dissem_send_timer_callback, NULL);
 
-    if(period_count >= DAS_NEIGHBOUR_DISCOVERY_PERIODS) {
+    if(period_count >= DAS_NEIGHBOUR_DISCOVERY_PERIODS && node_type != NODE_TYPE_SINK) {
         process_dissem();
         process_collisions();
     }
@@ -476,16 +488,13 @@ static void slot_timer_callback(void* ptr) {
 
 // Process Things {{{
 static void process_dissem() {
-    if(slot == BOTTOM) {
-        PRINTF("Processing dissem\n");
+    if(slot == BOTTOM && list_length(n_par) != 0) {
         int new_hop = BOTTOM;
         int new_parent = BOTTOM;
         int new_slot = BOTTOM;
         Neighbour* n = list_head(n_par);
         NeighbourInfo* parent_info = NULL;
-        PRINTF("BEFORE LOOP\n");
         while(n) {
-            PRINTF("LOOPING\n");
             NeighbourInfo* info = get_neighbourinfo(n->id);
             ASSERT(info);
             if(new_hop == BOTTOM || new_hop > info->hop) {
@@ -495,11 +504,10 @@ static void process_dissem() {
             }
             n = list_item_next(n);
         }
-        PRINTF("Decided on parent and hop\n");
         //TODO: Make sure things aren't still NULL
         new_hop += 1;
-        new_slot = parent_info->slot - rank(get_other(new_parent)->ids, new_parent) - 1; //TODO: Check get_other() doesn't return NULL
-        PRINTF("par=%d, slot=%d, hop=%d\n", new_parent, new_slot, new_hop);
+        new_slot = parent_info->slot - rank(get_other(new_parent)->ids, node_id) - 1; //TODO: Check get_other() doesn't return NULL
+        PRINTF("Process dissem: par=%d, slot=%d, hop=%d\n", new_parent, new_slot, new_hop);
         update_slot_and_hop(new_slot, new_hop);
         update_parent(new_parent);
 
@@ -520,16 +528,14 @@ static void process_collisions() {
 
 // Message Handlers {{{
 static void handle_dissem_message() {
-    //TODO: packetbuf_dataptr() probably points to the header? Remove header in RDC or framer?
     NeighbourInfoMessage* message = packetbuf_dataptr();
     add_my_n(message->id);
-
 
     int i;
     if(message->normal) {
         NeighbourInfo* message_info = NULL;
         for(i = 0; i < message->num_neighbours; i++) {
-            PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);
+            /*PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);*/
             add_neighbour_info(&(message->neighbours[i]));
             if(message->neighbours[i].id == message->id) {
                 message_info = &(message->neighbours[i]);
@@ -544,7 +550,7 @@ static void handle_dissem_message() {
         if(parent == message->id) {
             NeighbourInfo* message_info = NULL;
             for(i = 0; i < message->num_neighbours; i++) {
-                PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);
+                /*PRINTF("NeighbourInfo<id=%u,slot=%d,hop=%d>\n", message->neighbours[i].id, message->neighbours[i].slot, message->neighbours[i].hop);*/
                 add_neighbour_info(&(message->neighbours[i]));
                 if(message->neighbours[i].id == message->id) {
                     message_info = &(message->neighbours[i]);
@@ -591,7 +597,7 @@ static void packet_send(mac_callback_t sent, void* ptr) {
 /*---------------------------------------------------------------------------*/
 static void packet_input(void) {
     if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_DISSEM) {
-        PRINTF("DAS-mac: Received dissem message\n");
+        /*PRINTF("DAS-mac: Received dissem message\n");*/
         handle_dissem_message();
     }
     else if(packetbuf_attr(PACKETBUF_ATTR_PACKET_TYPE) == PACKET_TYPE_NORMAL) {

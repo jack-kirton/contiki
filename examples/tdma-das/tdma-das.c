@@ -26,6 +26,7 @@ static void sent_callback(void* ptr, int status, int transmissions) {
 
 static void das_callback(struct packetqueue* packets, mac_callback_t* sent, void** ptr) {
     //TODO: Create a packet in packetbuf from packets queue
+    printf("Aggregation callback active\n");
     *sent = sent_callback;
     *ptr = NULL;
 }
